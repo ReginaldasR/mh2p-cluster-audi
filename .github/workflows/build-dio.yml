@@ -1,0 +1,138 @@
+name: Build dio_cluster.so
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout mh2p-cluster
+        uses: actions/checkout@v5
+
+      - name: Clone QNX ARMv7 toolchain
+        run: |
+          git clone --depth=1 \
+            https://github.com/luka-dev/qnx65-armv7-toolchain.git \
+            qnx-toolchain
+
+      - name: Patch Debian expired repository check
+        run: |
+          cd qnx-toolchain
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("Dockerfile")
+          s = p.read_text()
+
+          old = "apt-get update"
+          new = (
+              "apt-get "
+              "-o Acquire::Check-Valid-Until=false "
+              "-o Acquire::Check-Date=false "
+              "update"
+          )
+
+          count = s.count(old)
+
+          print("Original apt-get update count:", count)
+
+          if count == 0:
+              raise SystemExit(
+                  "ERROR: Could not find 'apt-get update' in Dockerfile"
+              )
+
+          s = s.replace(old, new)
+          p.write_text(s)
+
+          print("Dockerfile patched successfully.")
+          PY
+
+          echo ""
+          echo "===== VERIFY PATCH ====="
+          grep -n "Check-Valid-Until" Dockerfile
+
+          echo ""
+          echo "===== VERIFY NO OLD COMMAND REMAINS ====="
+          if grep -n "apt-get update" Dockerfile; then
+            echo "ERROR: Unpatched apt-get update still exists"
+            exit 1
+          else
+            echo "OK: all apt-get update commands patched"
+          fi
+
+      - name: Build QNX toolchain
+        run: |
+          cd qnx-toolchain
+
+          docker build \
+            --platform=linux/amd64 \
+            --target base-env \
+            --build-arg BASE=base-8.5 \
+            -t qnx65-armv7-toolchain:8.5 \
+            .
+
+      - name: Verify QNX compiler
+        run: |
+          docker run --rm \
+            qnx65-armv7-toolchain:8.5 \
+            arm-unknown-nto-qnx6.5.0eabi-gcc --version
+
+      - name: Compile dio_cluster.so
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/src \
+            -w /src \
+            qnx65-armv7-toolchain:8.5 \
+            arm-unknown-nto-qnx6.5.0eabi-gcc \
+              -shared \
+              -fPIC \
+              -O2 \
+              -I/src/src/mib2q-carplay-rgi/c_hook/framework \
+              -I/src/src/mib2q-carplay-rgi/c_hook/routeguidance \
+              /src/src/dio_manager_preload.c \
+              /src/src/mib2q-carplay-rgi/c_hook/framework/pps_writer.c \
+              /src/src/mib2q-carplay-rgi/c_hook/routeguidance/rgd_tlv.c \
+              -lc \
+              -o /src/dio_cluster.so
+
+      - name: Inspect dio_cluster.so
+        run: |
+          echo "===== FILE ====="
+          file dio_cluster.so
+
+          echo ""
+          echo "===== SIZE ====="
+          ls -lh dio_cluster.so
+
+          echo ""
+          echo "===== SHA256 ====="
+          sha256sum dio_cluster.so
+
+          echo ""
+          echo "===== ELF HEADER ====="
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/src \
+            -w /src \
+            qnx65-armv7-toolchain:8.5 \
+            arm-unknown-nto-qnx6.5.0eabi-readelf \
+              -h dio_cluster.so
+
+          echo ""
+          echo "===== DYNAMIC DEPENDENCIES ====="
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/src \
+            -w /src \
+            qnx65-armv7-toolchain:8.5 \
+            arm-unknown-nto-qnx6.5.0eabi-readelf \
+              -d dio_cluster.so
+
+      - name: Upload dio_cluster.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: dio_cluster
+          path: dio_cluster.so
+          if-no-files-found: error
